@@ -1,385 +1,571 @@
-import tkinter as tk
+import pygame
 import math
 from queue import PriorityQueue
-import time
+from PIL import Image
+import os
 import numpy as np
 
-# ==============================
-# Config
-# ==============================
-ROWS, COLS = 30, 30
-WIDTH = 600
-CELL_SIZE = WIDTH // COLS
+# ------------------------------
+# CONFIGURACIÓN
+# ------------------------------
+GRID_SIZE = 60           # cantidad de celdas por lado (sube/baja para más/menos detalle)
+WINDOW = 800             # tamaño del lado del área del mapa (no incluye la barra inferior)
+FOOTER_H = 60            # alto de la barra inferior reducido
+IMG_FILENAME = "ciudad.jpg"
 
-COLOR_GRID = "gray80"
-COLOR_START = "lime"
-COLOR_END = "red"
-COLOR_OPEN = "cyan"
-COLOR_CLOSED = "orange"
-COLOR_PATH = "yellow"
-COLOR_WALL = "gray30"
+# Colores UI
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GRID_COLOR = (200, 200, 200)
+ORANGE = (255, 165, 0)      # inicio
+CYAN = (0, 180, 200)        # fin
+GREEN = (0, 200, 0)         # open set
+RED = (220, 0, 0)           # closed set
+PURPLE = (150, 0, 150)      # path
+CLOSED_ROAD = (244, 50, 11) # Color para rutas cerradas: #F4320B
+FOOTER_BG = (245, 245, 245)
+FOOTER_TEXT = (20, 20, 20)
 
-root = tk.Tk()
-root.title("A* en calles del mapa (auto + calibración + obstáculos manuales)")
-canvas = tk.Canvas(root, width=WIDTH, height=WIDTH, bg="white")
-canvas.pack()
+# Configuración de reconocimiento de carreteras MEJORADO
+ROAD_COLORS = [
+    (106, 95, 107),   # Color original #6a5f6b
+    (104, 97, 105),   # Color #686169
+    (128, 128, 128),  # Gris medio
+    (96, 96, 96),     # Gris oscuro
+    (160, 160, 160),  # Gris claro
+    (80, 80, 80),     # Gris muy oscuro
+    (200, 200, 200),  # Gris muy claro
+    (120, 120, 120),  # Gris intermedio
+    (140, 140, 140),  # Gris intermedio claro
+    (110, 110, 110),  # Gris intermedio oscuro
+]
 
-instructions = tk.Label(
-    root,
-    text=("Click Izq: Inicio | Click Der: Final | ESPACIO: A* | C: Reiniciar | "
-          "I: Cargar imagen | K: Calibrar | M: Máscara | Shift+Click: alternar obstáculo"),
-    font=("Arial", 10), fg="black")
-instructions.pack()
+# Tolerancia más agresiva para reconocer más carreteras
+ROAD_TOL = 50  # Aumentado significativamente
 
-grid = []
-start = None
-end = None
+# Configuración para análisis de luminosidad - EXPANDIDO
+USE_BRIGHTNESS_DETECTION = True
+MIN_BRIGHTNESS = 50      # Reducido para incluir carreteras más oscuras
+MAX_BRIGHTNESS = 200     # Aumentado para incluir carreteras más claras
 
-# máscara detectada originalmente y la máscara activa (editable)
-original_mask = np.zeros((ROWS, COLS), dtype=bool)
-walkable_mask = np.zeros((ROWS, COLS), dtype=bool)
-overlay_on = False
+# Configuración para análisis de saturación - MÁS PERMISIVO
+USE_SATURATION_FILTER = True
+MAX_SATURATION = 70      # Aumentado para ser más permisivo
 
-_background_photo = None
-_last_img_rgb = None  # PIL Image RGB (WIDTHxWIDTH)
+# Variable global para el estado del camino
+path_status = "Sin intentos de búsqueda"
 
-# ==============================
-# Nodos
-# ==============================
-class Node:
-    def __init__(self, r, c):
-        self.row, self.col = r, c
-        self.x, self.y = c * CELL_SIZE, r * CELL_SIZE
-        self.color = ""
-        self.canvas_id = None
-        self.neighbors = []
+# ------------------------------
+# UTILIDADES MEJORADAS
+# ------------------------------
+def rgb_to_hsv(r, g, b):
+    """Convierte RGB a HSV"""
+    r, g, b = r/255.0, g/255.0, b/255.0
+    max_val = max(r, g, b)
+    min_val = min(r, g, b)
+    diff = max_val - min_val
+    
+    # Value (brillo)
+    v = max_val
+    
+    # Saturation
+    s = 0 if max_val == 0 else diff / max_val
+    
+    # Hue
+    if diff == 0:
+        h = 0
+    elif max_val == r:
+        h = (60 * ((g - b) / diff) + 360) % 360
+    elif max_val == g:
+        h = (60 * ((b - r) / diff) + 120) % 360
+    else:
+        h = (60 * ((r - g) / diff) + 240) % 360
+    
+    return h, s * 100, v * 100
 
-    def draw(self):
-        if self.canvas_id:
-            canvas.delete(self.canvas_id)
-            self.canvas_id = None
-        if self.color:
-            outline = "white" if self.color in [COLOR_START, COLOR_END, COLOR_PATH] else COLOR_GRID
-            width = 2 if self.color in [COLOR_START, COLOR_END, COLOR_PATH] else 1
-            self.canvas_id = canvas.create_rectangle(
-                self.x, self.y, self.x+CELL_SIZE, self.y+CELL_SIZE,
-                fill=self.color, outline=outline, width=width
-            )
+def get_brightness(r, g, b):
+    """Calcula el brillo percibido de un color RGB"""
+    return 0.299 * r + 0.587 * g + 0.114 * b
 
-    def set_color(self, color):
-        self.color = color
-        self.draw()
-        if color in [COLOR_OPEN, COLOR_CLOSED]:
-            time.sleep(0.01)
-        elif color == COLOR_PATH:
-            time.sleep(0.02)
-        root.update()
+def rgb_distance(a, b):
+    """Distancia Euclídea en RGB"""
+    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
 
-    def reset_to_background(self):
-        if self.canvas_id:
-            canvas.delete(self.canvas_id)
-            self.canvas_id = None
-        self.color = ""
-
-    def is_wall(self):
-        return not walkable_mask[self.row, self.col]
-
-    def update_neighbors(self, grid):
-        self.neighbors = []
-        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-            r, c = self.row+dr, self.col+dc
-            if 0 <= r < ROWS and 0 <= c < COLS and not grid[r][c].is_wall():
-                self.neighbors.append(grid[r][c])
-
-# ==============================
-# A*
-# ==============================
-def heuristic(a,b):
-    return abs(a.row-b.row)+abs(a.col-b.col)
-
-def distance(a,b):
-    return 1
-
-def reconstruct_path(came_from, current):
-    path=[]
-    while current in came_from:
-        current = came_from[current]
-        if current.color not in [COLOR_START, COLOR_END]:
-            path.append(current)
-    for n in reversed(path):
-        n.set_color(COLOR_PATH)
-
-def a_star(start, end):
-    count=0
-    pq=PriorityQueue()
-    pq.put((0,count,start))
-    came_from={}
-    g={node:float("inf") for row in grid for node in row}
-    f={node:float("inf") for row in grid for node in row}
-    g[start]=0; f[start]=heuristic(start,end)
-    open_hash={start}
-
-    while not pq.empty():
-        _,_,cur=pq.get(); open_hash.remove(cur)
-        if cur==end:
-            reconstruct_path(came_from,end); return True
-        for nb in cur.neighbors:
-            tg=g[cur]+distance(cur,nb)
-            if tg<g[nb]:
-                came_from[nb]=cur; g[nb]=tg; f[nb]=tg+heuristic(nb,end)
-                if nb not in open_hash:
-                    count+=1; pq.put((f[nb],count,nb)); open_hash.add(nb)
-                    if nb.color not in [COLOR_START, COLOR_END]:
-                        nb.set_color(COLOR_OPEN)
-        if cur not in [start,end]:
-            cur.set_color(COLOR_CLOSED)
+def is_road_color_improved(rgb):
+    """
+    Función mejorada para detectar si un color corresponde a una carretera.
+    Usa criterios más amplios para capturar más variaciones.
+    """
+    r, g, b = rgb
+    
+    # Método 1: Comparación con colores conocidos de carreteras (más tolerante)
+    for road_color in ROAD_COLORS:
+        if rgb_distance(rgb, road_color) <= ROAD_TOL:
+            return True
+    
+    # Método 2: Análisis de brillo expandido
+    brightness = get_brightness(r, g, b)
+    if not (MIN_BRIGHTNESS <= brightness <= MAX_BRIGHTNESS):
+        return False
+    
+    # Método 3: Análisis de saturación más permisivo
+    h, s, v = rgb_to_hsv(r, g, b)
+    if s > MAX_SATURATION:
+        return False
+    
+    # Método 4: Detección amplia de tonos grises/neutrales
+    rgb_range = max(r, g, b) - min(r, g, b)
+    if rgb_range <= 60 and MIN_BRIGHTNESS <= brightness <= MAX_BRIGHTNESS:
+        return True
+    
+    # Método 5: Detección por rangos de colores comunes en carreteras
+    # Rango de grises oscuros a medios
+    if (75 <= r <= 170 and 70 <= g <= 170 and 75 <= b <= 170 and 
+        abs(r - g) <= 25 and abs(g - b) <= 25 and abs(r - b) <= 25):
+        return True
+    
+    # Método 6: Detección específica para tonos violeta-gris (como #6a5f6b)
+    if (90 <= r <= 130 and 80 <= g <= 120 and 90 <= b <= 130):
+        return True
+    
     return False
 
-# ==============================
-# Utilidades de dibujo/máscara
-# ==============================
-def make_grid():
-    return [[Node(r,c) for c in range(COLS)] for r in range(ROWS)]
+def analyze_image_colors(image_path, rows):
+    """Analiza los colores de la imagen para ayudar con la calibración"""
+    try:
+        pil_img = Image.open(image_path).convert("RGB")
+        pil_img = pil_img.resize((rows, rows), Image.NEAREST)
+        pixels = pil_img.load()
+        
+        color_histogram = {}
+        road_candidates = []
+        
+        for i in range(rows):
+            for j in range(rows):
+                rgb = pixels[j, i]
+                color_key = f"{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+                color_histogram[color_key] = color_histogram.get(color_key, 0) + 1
+                
+                if is_road_color_improved(rgb):
+                    road_candidates.append(rgb)
+        
+        # Mostrar estadísticas básicas
+        road_count = len(road_candidates)
+        total_pixels = rows * rows
+        road_percentage = (road_count / total_pixels) * 100
+        
+        print(f"\n=== ANÁLISIS RÁPIDO ===")
+        print(f"Píxeles detectados como carretera: {road_count}/{total_pixels} ({road_percentage:.1f}%)")
+        
+        # Mostrar solo los 5 colores más frecuentes
+        sorted_colors = sorted(color_histogram.items(), key=lambda x: x[1], reverse=True)
+        print("Top 5 colores más frecuentes:")
+        for i, (color_hex, count) in enumerate(sorted_colors[:5]):
+            r = int(color_hex[0:2], 16)
+            g = int(color_hex[2:4], 16) 
+            b = int(color_hex[4:6], 16)
+            percentage = (count / total_pixels) * 100
+            is_road = "SÍ" if is_road_color_improved((r, g, b)) else "NO"
+            print(f"  #{color_hex} RGB({r:3d},{g:3d},{b:3d}) - {percentage:4.1f}% - Carretera: {is_road}")
+        
+    except Exception as e:
+        print(f"No se pudo analizar la imagen: {e}")
 
-def draw_grid_lines():
-    for i in range(ROWS+1):
-        y=i*CELL_SIZE; canvas.create_line(0,y,WIDTH,y,fill=COLOR_GRID,width=1)
-    for i in range(COLS+1):
-        x=i*CELL_SIZE; canvas.create_line(x,0,x,WIDTH,fill=COLOR_GRID,width=1)
+def draw_rect_alpha(surface, color, rect, alpha):
+    s = pygame.Surface((rect[2], rect[3]), pygame.SRCALPHA)
+    r, g, b = color
+    s.fill((r, g, b, alpha))
+    surface.blit(s, (rect[0], rect[1]))
 
-def draw_nodes_from_mask():
-    for r in range(ROWS):
-        for c in range(COLS):
-            update_cell_draw(r, c)
+# ------------------------------
+# CELDA
+# ------------------------------
+class Cell:
+    def __init__(self, row, col, cell_px):
+        self.row = row
+        self.col = col
+        self.x = col * cell_px     # IMPORTANTE: x usa columna
+        self.y = row * cell_px     # IMPORTANTE: y usa fila
+        self.w = cell_px
 
-def update_cell_draw(r, c):
-    node = grid[r][c]
-    node.reset_to_background()
-    if not walkable_mask[r, c]:
-        node.color = COLOR_WALL
-    node.draw()
+        # Mapa base (derivado de la imagen)
+        self.walkable = True  # True si es carretera
+        self.original_color = None  # Color original del píxel
+        self.closed_by_user = False  # Nueva propiedad para marcar celdas cerradas por el usuario
+        # Overlays del algoritmo (se dibujan semitransparentes encima)
+        self.overlay = None   # None o color RGB
+        self.alpha = 0        # 0..255
 
-def toggle_mask_overlay():
-    global overlay_on
-    overlay_on = not overlay_on
-    if overlay_on:
-        for r in range(ROWS):
-            for c in range(COLS):
-                if walkable_mask[r,c]:
-                    canvas.create_rectangle(
-                        c*CELL_SIZE, r*CELL_SIZE, (c+1)*CELL_SIZE, (r+1)*CELL_SIZE,
-                        fill="#00ff0040", outline="")
+    def set_walkable(self, ok: bool, original_color=None):
+        self.walkable = ok
+        self.original_color = original_color
+        # Si se marca como no transitable por el usuario, establecer la bandera
+        if not ok and original_color is None:
+            self.closed_by_user = True
+
+    # Métodos de overlay (no cambian walkable)
+    def clear_overlay(self):
+        self.overlay = None
+        self.alpha = 0
+
+    def make_start(self):
+        self.overlay = ORANGE
+        self.alpha = 255
+
+    def make_end(self):
+        self.overlay = CYAN
+        self.alpha = 255
+
+    def make_open(self):
+        self.overlay = GREEN
+        self.alpha = 110
+
+    def make_closed(self):
+        self.overlay = RED
+        self.alpha = 90
+
+    def make_path(self):
+        self.overlay = PURPLE
+        self.alpha = 200
+
+    def draw(self, win):
+        # Dibujar fondo para celdas cerradas por el usuario
+        if self.closed_by_user:
+            draw_rect_alpha(win, CLOSED_ROAD, (self.x, self.y, self.w, self.w), 200)
+        
+        # Dibujar overlays
+        if self.overlay is not None and self.alpha > 0:
+            draw_rect_alpha(win, self.overlay, (self.x, self.y, self.w, self.w), self.alpha)
+
+    def __lt__(self, other):
+        return False
+
+# ------------------------------
+# GRID / IMAGEN
+# ------------------------------
+def load_background_image(path, target_px):
+    try:
+        img = pygame.image.load(path)
+        img = pygame.transform.smoothscale(img, (target_px, target_px))
+        return img
+    except Exception as e:
+        print(f"[WARN] No se pudo cargar la imagen '{path}': {e}")
+        return None
+
+def build_grid_from_image(rows, width_px, image_path):
+    # Creamos la grilla
+    cell_px = width_px // rows
+    grid = [[Cell(r, c, cell_px) for c in range(rows)] for r in range(rows)]
+
+    # Analizamos la imagen antes de procesarla
+    analyze_image_colors(image_path, rows)
+
+    # Leemos imagen con PIL y reducimos al tamaño del grid usando NEAREST
+    try:
+        pil_img = Image.open(image_path).convert("RGB")
+        pil_img = pil_img.resize((rows, rows), Image.NEAREST)
+        pixels = pil_img.load()
+    except Exception as e:
+        print(f"[WARN] No se pudo abrir '{image_path}'. Se asumirá todo NO caminable. Error: {e}")
+        for r in range(rows):
+            for c in range(rows):
+                grid[r][c].set_walkable(False)
+        return grid
+
+    # Estadísticas de detección
+    road_count = 0
+    total_count = rows * rows
+
+    # Mapeo: (x=j, y=i) => (col, fila)
+    for i in range(rows):
+        for j in range(rows):
+            rgb = pixels[j, i]
+            is_road = is_road_color_improved(rgb)
+            grid[i][j].set_walkable(is_road, rgb)
+            if is_road:
+                road_count += 1
+
+    road_percentage = (road_count / total_count) * 100
+    print(f"Detección final: {road_count}/{total_count} celdas transitables ({road_percentage:.1f}%)\n")
+
+    return grid
+
+def draw_grid_lines(win, rows, width_px):
+    gap = width_px // rows
+    # líneas horizontales
+    for i in range(rows + 1):
+        pygame.draw.line(win, GRID_COLOR, (0, i * gap), (width_px, i * gap), 1)
+    # líneas verticales
+    for j in range(rows + 1):
+        pygame.draw.line(win, GRID_COLOR, (j * gap, 0), (j * gap, width_px), 1)
+
+def draw_footer(win, width_px, footer_h, font):
+    global path_status
+    # Fondo
+    pygame.draw.rect(win, FOOTER_BG, (0, width_px, width_px, footer_h))
+    
+    # Línea de controles
+    controls = "Izq: Inicio | Der: Fin | Shift+Izq: Cerrar ruta | ESPACIO: A* | R: Recargar | D: Debug | ESC: Salir"
+    
+    # Línea de estado del camino
+    status_line = f"Estado: {path_status}"
+    
+    # Dibujar texto
+    y_offset = width_px + 8
+    
+    # Controles
+    surf = font.render(controls, True, FOOTER_TEXT)
+    win.blit(surf, (8, y_offset))
+    y_offset += surf.get_height() + 4
+    
+    # Estado
+    surf = font.render(status_line, True, FOOTER_TEXT)
+    win.blit(surf, (8, y_offset))
+
+def draw_everything(win, background, grid, rows, width_px, footer_h, font, debug_mode=False):
+    # fondo (imagen)
+    if background:
+        win.blit(background, (0, 0))
     else:
-        reset_grid()
+        win.fill(WHITE)
 
-# ==============================
-# Detección (HSV)
-# ==============================
-def rgb_to_hsv_np(arr):  # arr (H,W,3) 0..255
-    arr = arr.astype(np.float32)/255.0
-    import colorsys
-    hsv = np.zeros_like(arr)
-    for y in range(arr.shape[0]):
-        for x in range(arr.shape[1]):
-            hsv[y,x,:] = colorsys.rgb_to_hsv(arr[y,x,0], arr[y,x,1], arr[y,x,2])
-    return hsv
+    # Modo debug: mostrar celdas no transitables originales
+    if debug_mode:
+        for row in grid:
+            for cell in row:
+                if not cell.walkable and not cell.closed_by_user:
+                    draw_rect_alpha(win, RED, (cell.x, cell.y, cell.w, cell.w), 60)
 
-def auto_mask_from_image(img_rgb_600):
-    """Reglas HSV para gris + violeta asfáltico, reducción y limpieza ligera."""
-    from PIL import Image, ImageFilter
-    arr = np.array(img_rgb_600, dtype=np.uint8)
-    hsv = rgb_to_hsv_np(arr)
-    H, S, V = hsv[:,:,0]*360.0, hsv[:,:,1], hsv[:,:,2]
-
-    m1 = (S < 0.22) & (V > 0.28) & (V < 0.85)
-    m2 = (H > 260) & (H < 300) & (S > 0.18) & (S < 0.55) & (V > 0.28) & (V < 0.70)
-    mask = (m1 | m2)
-
-    small = Image.fromarray((mask.astype(np.uint8)*255)).resize((COLS, ROWS), Image.Resampling.BOX)
-    small = small.filter(ImageFilter.MaxFilter(3))
-    small = small.filter(ImageFilter.MinFilter(3))
-    return np.array(small) > 127
-
-calib_samples = []
-
-def start_calibration():
-    print("🧪 Calibración: haz 3–6 clics en la CARRETERA y pulsa ENTER.")
-    root.bind("<Return>", apply_calibration)
-    canvas.bind("<Button-1>", sample_click)
-
-def sample_click(event):
-    global calib_samples
-    if _last_img_rgb is None:
-        return
-    x = min(max(event.x,0), WIDTH-1)
-    y = min(max(event.y,0), WIDTH-1)
-    arr = np.array(_last_img_rgb)
-    r,g,b = arr[y,x]
-    import colorsys
-    h,s,v = colorsys.rgb_to_hsv(r/255.0,g/255.0,b/255.0)
-    calib_samples.append((h*360.0,s,v))
-    print(f"muestra {len(calib_samples)}: H={h*360:.1f} S={s:.2f} V={v:.2f}")
-
-def apply_calibration(event=None):
-    global walkable_mask, original_mask, calib_samples
-    if len(calib_samples)==0:
-        print("No hay muestras. Cancelo calibración."); return
-    hs = np.array(calib_samples)
-    Hm, Sm, Vm = hs.mean(axis=0)
-    dH = max(12, min(35, hs[:,0].ptp()/2 + 15))
-    dS = max(0.10, min(0.28, hs[:,1].ptp()/2 + 0.12))
-    dV = max(0.10, min(0.28, hs[:,2].ptp()/2 + 0.12))
-
-    arr = np.array(_last_img_rgb, dtype=np.uint8)
-    hsv = rgb_to_hsv_np(arr); H,S,V = hsv[:,:,0]*360.0, hsv[:,:,1], hsv[:,:,2]
-    m = (np.abs((H - Hm + 180) % 360 - 180) < dH) & (np.abs(S-Sm) < dS) & (np.abs(V-Vm) < dV)
-
-    from PIL import Image, ImageFilter, Image as PILImage
-    small = PILImage.fromarray((m.astype(np.uint8)*255)).resize((COLS, ROWS), PILImage.Resampling.BOX)
-    small = small.filter(ImageFilter.MaxFilter(3))
-    small = small.filter(ImageFilter.MinFilter(3))
-    original_mask = np.array(small) > 127
-    walkable_mask = original_mask.copy()
-
-    calib_samples = []
-    redraw_after_mask()
-    print("✅ Calibración aplicada. (Pulsa M para ver overlay)")
-
-# ==============================
-# Cargar imagen
-# ==============================
-def load_map_from_image(file_path):
-    global _background_photo, _last_img_rgb, original_mask, walkable_mask
-    from PIL import Image, ImageTk
-
-    img = Image.open(file_path).convert("RGB")
-    img_resized = img.resize((WIDTH, WIDTH), Image.Resampling.LANCZOS)
-    _last_img_rgb = img_resized.copy()
-    _background_photo = ImageTk.PhotoImage(img_resized)
-
-    canvas.delete("all")
-    canvas.create_image(WIDTH//2, WIDTH//2, image=_background_photo)
-
-    original_mask = auto_mask_from_image(img_resized)
-    walkable_mask = original_mask.copy()
-
-    draw_nodes_from_mask()
-    draw_grid_lines()
-
-def load_background_image_dialog():
-    from tkinter import filedialog
-    file_path = filedialog.askopenfilename(
-        title="Seleccionar imagen de mapa",
-        filetypes=[("Imágenes","*.png *.jpg *.jpeg *.bmp *.gif")]
-    )
-    if file_path:
-        load_map_from_image(file_path)
-        print("✅ Imagen cargada. Si algo falla, usa K para calibrar.")
-
-# ==============================
-# Interacción (inicio/fin, obstáculos, etc.)
-# ==============================
-def get_clicked_cell(event):
-    return event.y // CELL_SIZE, event.x // CELL_SIZE
-
-def left_click(event):
-    # INICIO
-    global start
-    r,c = get_clicked_cell(event)
-    if not (0 <= r < ROWS and 0 <= c < COLS): return
-    if not walkable_mask[r,c]: return
-    node = grid[r][c]
-    if node == end: return
-    if start: start.reset_to_background(); update_cell_draw(start.row, start.col)
-    start = node; start.set_color(COLOR_START)
-
-def right_click(event):
-    # FIN
-    global end
-    r,c = get_clicked_cell(event)
-    if not (0 <= r < ROWS and 0 <= c < COLS): return
-    if not walkable_mask[r,c]: return
-    node = grid[r][c]
-    if node == start: return
-    if end: end.reset_to_background(); update_cell_draw(end.row, end.col)
-    end = node; end.set_color(COLOR_END)
-
-def start_pathfinding(event):
-    if not start or not end:
-        print("❌ Coloca INICIO y FIN sobre la carretera"); return
+    # Dibujar celdas (incluyendo las cerradas por el usuario)
     for row in grid:
-        for node in row:
-            if node.color in [COLOR_OPEN, COLOR_CLOSED, COLOR_PATH]:
-                node.reset_to_background()
-                update_cell_draw(node.row, node.col)
-            node.update_neighbors(grid)
-    print("🔍 Ejecutando A*...")
-    ok = a_star(start, end)
-    print("✅ Camino encontrado" if ok else "❌ No hay camino")
+        for cell in row:
+            cell.draw(win)
 
-def reset_grid():
-    global start, end
-    start = None; end = None
-    redraw_after_mask()
+    # cuadrícula
+    draw_grid_lines(win, rows, width_px)
 
-def redraw_after_mask():
-    canvas.delete("all")
-    if _background_photo is not None:
-        canvas.create_image(WIDTH//2, WIDTH//2, image=_background_photo)
-    draw_nodes_from_mask()
-    draw_grid_lines()
+    # barra inferior
+    draw_footer(win, width_px, footer_h, font)
 
-def key_handler(event):
-    ch = event.char.lower()
-    if ch == "c": reset_grid()
-    elif ch == "i": load_background_image_dialog()
-    elif ch == "k": start_calibration()
-    elif ch == "m": toggle_mask_overlay()
+    pygame.display.update()
 
-# ---- Obstáculos manuales: Shift + click ----
-def shift_left_click(event):
-    # alterna entre transitable/muro
-    r,c = get_clicked_cell(event)
-    if not (0 <= r < ROWS and 0 <= c < COLS): return
+# ------------------------------
+# A* (8 direcciones, coste real)
+# ------------------------------
+def heuristic(p1, p2):
+    # Euclídea para combinar con diagonales
+    x1, y1 = p1
+    x2, y2 = p2
+    return math.hypot(x1 - x2, y1 - y2)
 
-    # no permitir modificar donde están start/end
-    if start and (r,c)==(start.row,start.col): return
-    if end and (r,c)==(end.row,end.col): return
+def neighbors_8(grid, node):
+    rows = len(grid)
+    r, c = node.row, node.col
+    res = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < rows and grid[nr][nc].walkable:
+                res.append(grid[nr][nc])
+    return res
 
-    walkable_mask[r,c] = not walkable_mask[r,c]
-    update_cell_draw(r, c)
+def run_astar(draw_fn, grid, start, end):
+    global path_status
+    path_status = "Buscando camino..."
+    
+    count = 0
+    open_set = PriorityQueue()
+    open_set.put((0, count, start))
+    came_from = {}
 
-def shift_drag(event):
-    # pintar mientras arrastras con Shift
-    shift_left_click(event)
+    g_score = {cell: float("inf") for row in grid for cell in row}
+    f_score = {cell: float("inf") for row in grid for cell in row}
+    g_score[start] = 0.0
+    f_score[start] = heuristic((start.row, start.col), (end.row, end.col))
 
-# ==============================
-# Inicializar
-# ==============================
-canvas.bind("<Button-1>", left_click)
-canvas.bind("<Button-3>", right_click)
-canvas.bind("<Shift-Button-1>", shift_left_click)
-canvas.bind("<Shift-B1-Motion>", shift_drag)
+    open_hash = {start}
 
-root.bind("<space>", start_pathfinding)
-root.bind("<Key>", key_handler)
-canvas.focus_set()
+    while not open_set.empty():
+        # permitimos cerrar ventana durante cálculo
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                raise SystemExit
 
-grid = make_grid()
+        current = open_set.get()[2]
+        open_hash.remove(current)
 
-# Carga automática (ajusta la ruta si hace falta)
-try:
-    DEFAULT_IMG = r"/mnt/data/242bc1d8-997b-4846-88b3-f68fbafc102c.jpg"
-    load_map_from_image(DEFAULT_IMG)
-    print("🖼️ Mapa cargado (AUTO). Shift+Click para poner/quitar obstáculos.")
-except Exception as e:
-    print("Pulsa I para cargar tu imagen. Detalle:", e)
+        if current == end:
+            # reconstrucción del camino
+            cur = end
+            path_length = 0
+            while cur in came_from:
+                prev = came_from[cur]
+                # Calcular distancia real
+                path_length += math.hypot(cur.row - prev.row, cur.col - prev.col)
+                cur = prev
+                if cur not in (start, end):
+                    cur.make_path()
+                    draw_fn()
+            start.make_start()
+            end.make_end()
+            path_status = f"¡CAMINO ENCONTRADO! Longitud: {path_length:.1f} unidades"
+            print(f"¡Camino encontrado! Longitud: {path_length:.2f} unidades")
+            return True
 
-print("""
-Extras:
-- Shift + click (o arrastrar): alterna obstáculo en la celda.
-- K: Calibración por clics (ENTER para aplicar).
-- M: Ver/ocultar overlay verde de celdas transitables.
-""")
+        # expandir
+        for nb in neighbors_8(grid, current):
+            # coste real (diagonal = sqrt(2), ortogonal = 1)
+            step = math.hypot(nb.row - current.row, nb.col - current.col)
+            tentative_g = g_score[current] + step
 
-root.mainloop()
+            if tentative_g < g_score[nb]:
+                came_from[nb] = current
+                g_score[nb] = tentative_g
+                f_score[nb] = tentative_g + heuristic((nb.row, nb.col), (end.row, end.col))
+                if nb not in open_hash:
+                    count += 1
+                    open_set.put((f_score[nb], count, nb))
+                    open_hash.add(nb)
+                    if nb not in (start, end):
+                        nb.make_open()
+
+        if current not in (start, end):
+            current.make_closed()
+
+        draw_fn()
+
+    path_status = "NO SE ENCONTRÓ CAMINO - Verifica que los puntos estén conectados"
+    print("No se encontró camino posible")
+    return False
+
+# ------------------------------
+# INPUT / POS
+# ------------------------------
+def get_cell_from_mouse(pos, rows, width_px):
+    x, y = pos
+    if y >= width_px or x >= width_px or x < 0 or y < 0:
+        return None  # clic en la barra inferior o fuera
+    gap = width_px // rows
+    col = x // gap
+    row = y // gap
+    return (row, col)
+
+# ------------------------------
+# MAIN
+# ------------------------------
+def main():
+    global path_status
+    pygame.init()
+    pygame.display.set_caption("A* Mejorado - Detección Avanzada de Carreteras")
+    win = pygame.display.set_mode((WINDOW, WINDOW + FOOTER_H))
+    font = pygame.font.SysFont("Arial", 12)
+
+    # Imagen de fondo
+    img_path = os.path.join(os.getcwd(), IMG_FILENAME)
+    background = load_background_image(img_path, WINDOW)
+
+    # Grid derivado de la imagen (walkable si es carretera detectada)
+    grid = build_grid_from_image(GRID_SIZE, WINDOW, img_path)
+
+    start = None
+    end = None
+    running = True
+    solving = False
+    debug_mode = False
+
+    def redraw():
+        draw_everything(win, background, grid, GRID_SIZE, WINDOW, FOOTER_H, font, debug_mode)
+
+    print("=== CONTROLES ===")
+    print("Clic izquierdo: Establecer punto de inicio")
+    print("Clic derecho: Establecer punto de destino")
+    print("Shift + Clic izquierdo: Cerrar ruta")
+    print("ESPACIO: Ejecutar A* | R: Recargar | D: Debug | ESC: Salir")
+
+    while running:
+        redraw()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+            # Ejecutar A*
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE and not solving:
+                if start and end:
+                    if not start.walkable or not end.walkable:
+                        path_status = "ERROR: Inicio o destino en zona no transitable"
+                        if start and not start.walkable:
+                            start.make_closed()
+                        if end and not end.walkable:
+                            end.make_closed()
+                        redraw()
+                    else:
+                        solving = True
+                        # limpiar overlays previos excepto inicio/fin
+                        for row in grid:
+                            for cell in row:
+                                if cell not in (start, end):
+                                    cell.clear_overlay()
+                        start.make_start()
+                        end.make_end()
+                        run_astar(redraw, grid, start, end)
+                        solving = False
+                else:
+                    path_status = "Establece punto de inicio y destino"
+
+            # Recargar imagen
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r and not solving:
+                start = None
+                end = None
+                path_status = "Imagen recargada"
+                background = load_background_image(img_path, WINDOW)
+                grid = build_grid_from_image(GRID_SIZE, WINDOW, img_path)
+
+            # Toggle debug mode
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_d and not solving:
+                debug_mode = not debug_mode
+
+            # Salir con ESC
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
+
+            # Clic izquierdo
+            if pygame.mouse.get_pressed()[0] and not solving:
+                cell_rc = get_cell_from_mouse(pygame.mouse.get_pos(), GRID_SIZE, WINDOW)
+                if cell_rc:
+                    r, c = cell_rc
+                    cell = grid[r][c]
+                    
+                    # Verificar si Shift está presionado (cerrar ruta)
+                    keys = pygame.key.get_pressed()
+                    if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+                        cell.set_walkable(False)
+                        cell.clear_overlay()
+                        path_status = f"Ruta cerrada en ({r}, {c})"
+                    else:
+                        # Establecer punto de inicio
+                        if start and start is not cell:
+                            start.clear_overlay()
+                        start = cell
+                        start.make_start()
+                        path_status = f"Inicio en ({r}, {c})"
+
+            # Clic derecho -> FIN
+            if pygame.mouse.get_pressed()[2] and not solving:
+                cell_rc = get_cell_from_mouse(pygame.mouse.get_pos(), GRID_SIZE, WINDOW)
+                if cell_rc:
+                    r, c = cell_rc
+                    cell = grid[r][c]
+                    if end and end is not cell:
+                        end.clear_overlay()
+                    end = cell
+                    end.make_end()
+                    path_status = f"Destino en ({r}, {c})"
+
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()
